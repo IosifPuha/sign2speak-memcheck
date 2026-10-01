@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Sign2Speak memory check</title>
+  <style>
+    :root {
+      --bg: #f7f7f5;
+      --fg: #1c1c1a;
+      --mut: #6b6b66;
+      --card: #fff;
+      --line: #d9d9d3;
+      --acc: #0b6b5c;
+      --bad: #b3261e
+    }
+
+    @media (prefers-color-scheme:dark) {
+      :root {
+        --bg: #141413;
+        --fg: #ecece8;
+        --mut: #9a9a93;
+        --card: #1e1e1c;
+        --line: #34342f;
+        --acc: #4cc2ad;
+        --bad: #ff8a80
+      }
+    }
+
+    * {
+      box-sizing: border-box
+    }
+
+    body {
+      margin: 0;
+      padding: max(12px, env(safe-area-inset-top)) 14px max(12px, env(safe-area-inset-bottom));
+      background: var(--bg);
+      color: var(--fg);
+      font: 15px/1.45 system-ui, -apple-system, sans-serif
+    }
+
+    main {
+      max-width: 640px;
+      margin: 0 auto
+    }
+
+    h1 {
+      font-size: 20px;
+      margin: 6px 0 2px
+    }
+
+    p {
+      margin: 4px 0 10px;
+      color: var(--mut)
+    }
+
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      margin: 10px 0
+    }
+
+    h2 {
+      font-size: 15px;
+      margin: 0 0 8px
+    }
+
+    button {
+      font: inherit;
+      padding: 10px 14px;
+      margin: 0 6px 6px 0;
+      border: 1px solid var(--acc);
+      background: var(--acc);
+      color: var(--bg);
+      border-radius: 6px
+    }
+
+    button.alt {
+      background: transparent;
+      color: var(--acc)
+    }
+
+    button:disabled {
+      opacity: .45
+    }
+
+    label {
+      display: inline-block;
+      margin: 0 12px 6px 0
+    }
+
+    select {
+      font: inherit
+    }
+
+    video {
+      width: 100%;
+      max-height: 220px;
+      background: #000;
+      border-radius: 6px;
+      display: none;
+      transform: scaleX(-1)
+    }
+
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 12.5px/1.4 ui-monospace, Menlo, monospace;
+      max-height: 320px;
+      overflow: auto
+    }
+
+    .warn {
+      color: var(--bad)
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <h1>Sign2Speak memory check</h1>
+    <p>Run in order. If the tab dies during a probe, reopen this page: it reports where the previous run stopped.</p>
+
+    <section id="prev" hidden>
+      <h2 class="warn">Previous run did not finish</h2>
+      <pre id="prevtxt"></pre>
+    </section>
+
+    <section>
+      <h2>1. Device</h2>
+      <button id="bInfo">Read device info</button>
+    </section>
+
+    <section>
+      <h2>2. Baseline load (optional)</h2>
+      <p>Camera and hand + face landmarkers, like the real app. Leave running while you do step 3.</p>
+      <label><input type="checkbox" id="cbFace" checked> face</label>
+      <label><input type="checkbox" id="cbHand" checked> hand</label>
+      <label>delegate <select id="selDel">
+          <option>GPU</option>
+          <option>CPU</option>
+        </select></label><br>
+      <button id="bCam">Start camera + MediaPipe</button>
+      <button id="bCamStop" class="alt" disabled>Stop</button>
+      <video id="vid" playsinline muted></video>
+    </section>
+
+    <section>
+      <h2>3. Memory probes</h2>
+      <p>Allocates memory in steps until the browser refuses or kills the tab.</p>
+      <label>step MB <select id="selStep">
+          <option>64</option>
+          <option selected>128</option>
+          <option>256</option>
+        </select></label>
+      <label>limit MB <select id="selMax">
+          <option>1024</option>
+          <option>2048</option>
+          <option selected>4096</option>
+        </select></label><br>
+      <button id="bGpu">GPU probe (WebGPU)</button>
+      <button id="bJs">JS probe (ArrayBuffer)</button>
+      <button id="bStop" class="alt" disabled>Stop</button>
+    </section>
+
+    <section>
+      <h2>Log</h2>
+      <pre id="log"></pre>
+      <p></p>
+      <button id="bCopy" class="alt">Copy report</button>
+      <button id="bClear" class="alt">Clear breadcrumb</button>
+    </section>
+  </main>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const logEl = $('log');
+    const KEY = 'memcheck.run';
+    let stopFlag = false, camStream = null, camOn = false, frames = 0;
+
+    function log(m, bad) {
+      const t = ((performance.now() / 1000) | 0) + 's';
+      logEl.textContent += `[${t}] ${m}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function crumb(o) {try {localStorage.setItem(KEY, JSON.stringify(o));} catch (e) { } }
+    function readCrumb() {try {return JSON.parse(localStorage.getItem(KEY) || 'null');} catch (e) {return null;} }
+
+    // Show where a previous run died (tab kill leaves running:true behind).
+    (function () {
+      const c = readCrumb();
+      if (c && c.running) {
+        $('prev').hidden = false;
+        $('prevtxt').textContent =
+          `Probe: ${c.mode}\nLast step started: ${c.mb} MB allocated\nCamera + MediaPipe: ${c.cam ? 'on' : 'off'}\nStep size: ${c.step} MB`;
+      }
+    })();
+
+    $('bClear').onclick = () => {try {localStorage.removeItem(KEY);} catch (e) { } $('prev').hidden = true; log('breadcrumb cleared');};
+    $('bCopy').onclick = async () => {
+      try {await navigator.clipboard.writeText(logEl.textContent); log('report copied');}
+      catch (e) {log('copy failed; select the log text manually');}
+    };
+
+    // ---- 1. Device info ----
+    $('bInfo').onclick = async () => {
+      log('UA: ' + navigator.userAgent);
+      log('standalone (home-screen app): ' + (navigator.standalone === true || matchMedia('(display-mode: standalone)').matches));
+      log('deviceMemory (GB, Chrome only): ' + (navigator.deviceMemory ?? 'n/a'));
+      log('cores: ' + navigator.hardwareConcurrency);
+      log('screen: ' + screen.width + 'x' + screen.height + ' @' + devicePixelRatio + 'x');
+      log('secure context: ' + isSecureContext + ' | camera API: ' + !!navigator.mediaDevices?.getUserMedia);
+      log('wake lock: ' + ('wakeLock' in navigator) + ' | speech synth: ' + ('speechSynthesis' in window) +
+        ' | speech recog: ' + ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window));
+      if (!navigator.gpu) {log('WebGPU: NOT available'); return;}
+      try {
+        const a = await navigator.gpu.requestAdapter();
+        if (!a) {log('WebGPU: adapter is null'); return;}
+        const L = a.limits;
+        log('WebGPU adapter OK; f16 support: ' + a.features.has('shader-f16'));
+        log('maxBufferSize: ' + (L.maxBufferSize / 1048576 | 0) + ' MB');
+        log('maxStorageBufferBindingSize: ' + (L.maxStorageBufferBindingSize / 1048576 | 0) + ' MB');
+        log('(Gemma 4 E2B web build needs roughly 1.8 GB GPU + 1.5 GB CPU on desktop Chrome)');
+      } catch (e) {log('WebGPU error: ' + e);}
+    };
+
+    // ---- 2. Camera + MediaPipe baseline ----
+    const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+    const HAND = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+    const FACE = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+
+    $('bCam').onclick = async () => {
+      $('bCam').disabled = true;
+      try {
+        camStream = await navigator.mediaDevices.getUserMedia({video: {facingMode: 'user', width: 640, height: 480}, audio: false});
+        const v = $('vid'); v.srcObject = camStream; v.style.display = 'block'; await v.play();
+        log('camera started ' + v.videoWidth + 'x' + v.videoHeight);
+        let hand = null, face = null;
+        if ($('cbHand').checked || $('cbFace').checked) {
+          const {FilesetResolver, HandLandmarker, FaceLandmarker} = await import(MP + '/vision_bundle.mjs');
+          const fs = await FilesetResolver.forVisionTasks(MP + '/wasm');
+          const delegate = $('selDel').value;
+          if ($('cbHand').checked) hand = await HandLandmarker.createFromOptions(fs, {baseOptions: {modelAssetPath: HAND, delegate}, runningMode: 'VIDEO', numHands: 2});
+          if ($('cbFace').checked) face = await FaceLandmarker.createFromOptions(fs, {baseOptions: {modelAssetPath: FACE, delegate}, runningMode: 'VIDEO'});
+          log('MediaPipe loaded (' + delegate + '): hand=' + !!hand + ' face=' + !!face);
+        }
+        camOn = true; frames = 0; $('bCamStop').disabled = false;
+        const t0 = performance.now();
+        const loop = () => {
+          if (!camOn) return;
+          const ts = performance.now();
+          try {hand && hand.detectForVideo(v, ts); face && face.detectForVideo(v, ts);} catch (e) { }
+          frames++; requestAnimationFrame(loop);
+        };
+        loop();
+        const fpsTimer = setInterval(() => {
+          if (!camOn) return clearInterval(fpsTimer);
+          log('inference fps ~' + (frames / ((performance.now() - t0) / 1000)).toFixed(1));
+        }, 10000);
+      } catch (e) {log('camera/MediaPipe error: ' + e); $('bCam').disabled = false;}
+    };
+    $('bCamStop').onclick = () => {
+      camOn = false; camStream && camStream.getTracks().forEach(t => t.stop());
+      $('vid').style.display = 'none'; $('bCam').disabled = false; $('bCamStop').disabled = true; log('camera stopped');
+    };
+
+    // ---- 3. Memory probes ----
+    function setBusy(b) {$('bGpu').disabled = b; $('bJs').disabled = b; $('bStop').disabled = !b;}
+    $('bStop').onclick = () => {stopFlag = true;};
+
+    async function runProbe(mode, allocStep) {
+      const step = +$('selStep').value, max = +$('selMax').value;
+      stopFlag = false; setBusy(true);
+      log(`--- ${mode} probe: step ${step} MB, limit ${max} MB, camera ${camOn ? 'on' : 'off'} ---`);
+      let mb = 0;
+      try {
+        const ctx = await allocStep.init(step);
+        while (mb < max && !stopFlag) {
+          crumb({running: true, mode, mb, step, cam: camOn});   // written BEFORE the risky step
+          await allocStep.next(ctx, step);
+          mb += step;
+          log(mode + ' allocated ' + mb + ' MB');
+          await new Promise(r => setTimeout(r, 60));
+        }
+        log(stopFlag ? `stopped at ${mb} MB` : `reached limit ${max} MB without failure`);
+      } catch (e) {
+        log(`FAILED after ${mb} MB (next step ${step} MB): ${e && e.message || e}`, true);
+      }
+      crumb({running: false, mode, mb, step, cam: camOn});
+      allocStep.free && allocStep.free();
+      setBusy(false);
+      log('freed. Peak that worked: ' + mb + ' MB');
+    }
+
+    const held = [];
+    const jsProbe = {
+      init: async () => {held.length = 0;},
+      next: async (_, step) => {const a = new Uint8Array(step * 1048576); a.fill(7); held.push(a);},
+      free: () => {held.length = 0;}
+    };
+
+    let gpu = null;
+    const gpuProbe = {
+      init: async (step) => {
+        if (!navigator.gpu) throw new Error('WebGPU not available');
+        const a = await navigator.gpu.requestAdapter();
+        if (!a) throw new Error('no WebGPU adapter');
+        const size = Math.min(step * 1048576, a.limits.maxBufferSize);
+        if (size < step * 1048576) log('note: maxBufferSize caps each buffer at ' + (size / 1048576 | 0) + ' MB');
+        const dev = await a.requestDevice({
+          requiredLimits: {
+            maxBufferSize: a.limits.maxBufferSize, maxStorageBufferBindingSize: a.limits.maxStorageBufferBindingSize
+          }
+        });
+        dev.lost.then(i => log('GPU device lost: ' + i.reason + ' ' + i.message));
+        gpu = {dev, bufs: [], size, filler: new Uint8Array(16 * 1048576).fill(3)};
+        return gpu;
+      },
+      next: async (g) => {
+        g.dev.pushErrorScope('out-of-memory');
+        const b = g.dev.createBuffer({size: g.size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+        for (let off = 0; off < g.size; off += g.filler.byteLength)       // write so memory is really committed
+          g.dev.queue.writeBuffer(b, off, g.filler, 0, Math.min(g.filler.byteLength, g.size - off));
+        await g.dev.queue.onSubmittedWorkDone();
+        const err = await g.dev.popErrorScope();
+        if (err) throw new Error('out-of-memory: ' + err.message);
+        g.bufs.push(b);
+      },
+      free: () => {if (gpu) {gpu.bufs.forEach(b => b.destroy()); gpu.dev.destroy(); gpu = null;} }
+    };
+
+    $('bGpu').onclick = () => runProbe('GPU', gpuProbe);
+    $('bJs').onclick = () => runProbe('JS', jsProbe);
+  </script>
+</body>
+
+</html>
