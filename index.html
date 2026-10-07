@@ -26,8 +26,8 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font:12.5px/1.4 ui-monos
 </head>
 <body>
 <main>
-<h1>Sign2Speak memory check v2</h1>
-<p>Run in order. If the tab dies during a probe, reopen this page: it reports where the previous run stopped.</p>
+<h1>Sign2Speak memory check v3 (allocation stress test)</h1>
+<p>Run in order and keep this page visible. Reload before each comparison run. If a run is interrupted, reopen this page to inspect its last saved checkpoint; interruption alone does not prove an out-of-memory crash.</p>
 
 <section id="prev" hidden><h2 class="warn">Previous run did not finish</h2><pre id="prevtxt"></pre></section>
 
@@ -38,7 +38,7 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font:12.5px/1.4 ui-monos
 
 <section>
 <h2>2. Baseline load (optional)</h2>
-<p>Camera and hand + face landmarkers, like the real app. Leave running while you do step 3.</p>
+<p>Optional camera and hand + face landmark workload. Leave running during step 3. This approximates part of a vision app, not Gemma inference.</p>
 <label><input type="checkbox" id="cbFace" checked> face</label>
 <label><input type="checkbox" id="cbHand" checked> hand</label>
 <label>delegate <select id="selDel"><option>GPU</option><option>CPU</option></select></label><br>
@@ -49,9 +49,9 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font:12.5px/1.4 ui-monos
 
 <section>
 <h2>3. Memory probes</h2>
-<p>Allocates random (incompressible) data in steps until the browser refuses or kills the tab. For a realistic result, start the camera in step 2 first. "JS + GPU" fills both at once, like a model loaded into memory and then uploaded to the GPU. The limit is total MB.</p>
-<label>step MB <select id="selStep"><option>64</option><option selected>128</option><option>256</option></select></label>
-<label>limit MB <select id="selMax"><option>1024</option><option>2048</option><option selected>4096</option></select></label><br>
+<p>Fills retained buffers using random data. "JS + GPU" allocates the selected step on each side. Totals are buffer capacities in MiB (1,048,576 bytes), not measured process memory or a Gemma memory requirement. CPU/GPU storage may share physical memory; browser, camera, staging, and model overhead are not measured. Stop takes effect between allocation steps.</p>
+<label>step MiB per side <select id="selStep"><option>64</option><option selected>128</option><option>256</option></select></label>
+<label>total buffer limit MiB <select id="selMax"><option>1024</option><option>2048</option><option selected>4096</option></select></label><br>
 <button id="bGpu">GPU probe (WebGPU)</button>
 <button id="bJs">JS probe (ArrayBuffer)</button>
 <button id="bBoth">JS + GPU together</button>
@@ -72,13 +72,16 @@ const $ = id => document.getElementById(id);
 const logEl = $('log');
 const KEY = 'memcheck.run';
 let stopFlag = false, camStream = null, camOn = false, frames = 0;
+let hand = null, face = null, frameId = null, fpsTimer = null;
+let startingCamera = false, busy = false, baselineError = null, runError = null;
+let activeRun = null, storageWarningShown = false;
 
 function log(m, bad) {
   const t = ((performance.now() / 1000) | 0) + 's';
   logEl.textContent += `[${t}] ${m}\n`;
   logEl.scrollTop = logEl.scrollHeight;
 }
-// Incompressible data: iOS compresses idle memory pages, so constant fills could under-count real model weights.
+// Random bytes avoid trivial zero-filled pages. Reusing this pool is not a model-memory simulation.
 let pool = null;
 function makePool() {
   if (pool) return pool;
@@ -86,22 +89,40 @@ function makePool() {
   for (let o = 0; o < pool.length; o += 65536) crypto.getRandomValues(pool.subarray(o, o + 65536));
   return pool;
 }
-function crumb(o) { try { localStorage.setItem(KEY, JSON.stringify(o)); } catch (e) {} }
+function crumb(o) {
+  try { localStorage.setItem(KEY, JSON.stringify(o)); }
+  catch (e) {
+    if (!storageWarningShown) log('WARNING: checkpoints cannot be saved: ' + e);
+    storageWarningShown = true;
+  }
+}
 function readCrumb() { try { return JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) { return null; } }
 
-// Show where a previous run died (tab kill leaves running:true behind).
+// An unfinished checkpoint may mean a crash, reload, navigation, or interruption.
 (function () {
   const c = readCrumb();
   if (c && c.running) {
     $('prev').hidden = false;
     $('prevtxt').textContent =
-      `Probe: ${c.mode}\nLast step started: ${c.mb} MB allocated\nCamera + MediaPipe: ${c.cam ? 'on' : 'off'}\nStep size: ${c.step} MB`;
+      'Unfinished run (cause unknown). Legacy v2 mb means the amount before a step.\n' + JSON.stringify(c, null, 2);
   }
 })();
 
-$('bClear').onclick = () => { try { localStorage.removeItem(KEY); } catch (e) {} $('prev').hidden = true; log('breadcrumb cleared'); };
+$('bClear').onclick = () => {
+  try {
+    localStorage.removeItem(KEY);
+    $('prev').hidden = true;
+    log('breadcrumb cleared');
+  } catch (e) { log('Could not clear breadcrumb: ' + e); }
+};
 $('bCopy').onclick = async () => {
-  try { await navigator.clipboard.writeText(logEl.textContent); log('report copied'); }
+  try {
+    const previous = $('prev').hidden ? '' : $('prevtxt').textContent + '\n';
+    const report = previous + logEl.textContent + '\nSaved checkpoint:\n' +
+      JSON.stringify(readCrumb(), null, 2);
+    await navigator.clipboard.writeText(report);
+    log('report copied');
+  }
   catch (e) { log('copy failed; select the log text manually'); }
 };
 
@@ -121,9 +142,9 @@ $('bInfo').onclick = async () => {
     if (!a) { log('WebGPU: adapter is null'); return; }
     const L = a.limits;
     log('WebGPU adapter OK; f16 support: ' + a.features.has('shader-f16'));
-    log('maxBufferSize: ' + (L.maxBufferSize / 1048576 | 0) + ' MB');
-    log('maxStorageBufferBindingSize: ' + (L.maxStorageBufferBindingSize / 1048576 | 0) + ' MB');
-    log('(Gemma 4 E2B web build needs roughly 1.8 GB GPU + 1.5 GB CPU on desktop Chrome)');
+    log('maxBufferSize: ' + (L.maxBufferSize / 1048576 | 0) + ' MiB per buffer');
+    log('maxStorageBufferBindingSize: ' + (L.maxStorageBufferBindingSize / 1048576 | 0) + ' MiB per binding');
+    log('These are per-resource API limits, not total available RAM. No Gemma model is loaded.');
   } catch (e) { log('WebGPU error: ' + e); }
 };
 
@@ -132,13 +153,31 @@ const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
 const HAND = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
 const FACE = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 
+function stopCamera() {
+  camOn = false;
+  cancelAnimationFrame(frameId);
+  clearInterval(fpsTimer);
+  frameId = fpsTimer = null;
+  camStream?.getTracks().forEach(t => t.stop());
+  camStream = null;
+  $('vid').srcObject = null;
+  $('vid').style.display = 'none';
+  for (const model of [hand, face]) {
+    try { model?.close(); } catch (e) { log('model cleanup error: ' + e); }
+  }
+  hand = face = null;
+  updateControls();
+}
+
 $('bCam').onclick = async () => {
-  $('bCam').disabled = true;
+  if (busy || startingCamera || camOn) return;
+  startingCamera = true;
+  baselineError = null;
+  updateControls();
   try {
     camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 640, height: 480 }, audio: false });
     const v = $('vid'); v.srcObject = camStream; v.style.display = 'block'; await v.play();
     log('camera started ' + v.videoWidth + 'x' + v.videoHeight);
-    let hand = null, face = null;
     if ($('cbHand').checked || $('cbFace').checked) {
       const { FilesetResolver, HandLandmarker, FaceLandmarker } = await import(MP + '/vision_bundle.mjs');
       const fs = await FilesetResolver.forVisionTasks(MP + '/wasm');
@@ -147,57 +186,134 @@ $('bCam').onclick = async () => {
       if ($('cbFace').checked) face = await FaceLandmarker.createFromOptions(fs, { baseOptions: { modelAssetPath: FACE, delegate }, runningMode: 'VIDEO' });
       log('MediaPipe loaded (' + delegate + '): hand=' + !!hand + ' face=' + !!face);
     }
-    camOn = true; frames = 0; $('bCamStop').disabled = false;
-    const t0 = performance.now();
+    camOn = true; frames = 0;
+    let t0 = performance.now(), lastVideoTime = -1;
+    log('baseline: delegate=' + $('selDel').value + ' hand=' + !!hand + ' face=' + !!face);
     const loop = () => {
       if (!camOn) return;
-      const ts = performance.now();
-      try { hand && hand.detectForVideo(v, ts); face && face.detectForVideo(v, ts); } catch (e) {}
-      frames++; requestAnimationFrame(loop);
+      if (v.readyState >= 2 && v.currentTime !== lastVideoTime) {
+        lastVideoTime = v.currentTime;
+        const ts = performance.now();
+        try {
+          hand?.detectForVideo(v, ts);
+          face?.detectForVideo(v, ts);
+          frames++;
+        } catch (e) {
+          baselineError = 'baseline inference failed: ' + e;
+          log(baselineError);
+          stopCamera();
+          return;
+        }
+      }
+      frameId = requestAnimationFrame(loop);
     };
-    loop();
-    const fpsTimer = setInterval(() => {
-      if (!camOn) return clearInterval(fpsTimer);
-      log('inference fps ~' + (frames / ((performance.now() - t0) / 1000)).toFixed(1));
+    fpsTimer = setInterval(() => {
+      const now = performance.now();
+      log((hand || face ? 'successful processed frames/s ~' : 'camera frames observed/s ~') +
+        (frames / ((now - t0) / 1000)).toFixed(1));
+      frames = 0; t0 = now;
     }, 10000);
-  } catch (e) { log('camera/MediaPipe error: ' + e); $('bCam').disabled = false; }
+    loop();
+  } catch (e) {
+    baselineError = 'camera/MediaPipe error: ' + e;
+    log(baselineError);
+    stopCamera();
+  } finally {
+    startingCamera = false;
+    updateControls();
+  }
 };
 $('bCamStop').onclick = () => {
-  camOn = false; camStream && camStream.getTracks().forEach(t => t.stop());
-  $('vid').style.display = 'none'; $('bCam').disabled = false; $('bCamStop').disabled = true; log('camera stopped');
+  if (busy) return;
+  stopCamera();
+  log('camera stopped; reload before a comparison run');
 };
 
 // ---- 3. Memory probes ----
-function setBusy(b) { ['bGpu', 'bJs', 'bBoth'].forEach(id => $(id).disabled = b); $('bStop').disabled = !b; }
+function updateControls() {
+  const locked = busy || startingCamera;
+  ['bGpu', 'bJs', 'bBoth', 'bInfo', 'bClear', 'selStep', 'selMax']
+    .forEach(id => $(id).disabled = locked);
+  ['cbHand', 'cbFace', 'selDel'].forEach(id => $(id).disabled = locked || camOn);
+  $('bCam').disabled = locked || camOn;
+  $('bCamStop').disabled = locked || !camOn;
+  $('bStop').disabled = !busy;
+}
+function setBusy(b) { busy = b; updateControls(); }
+document.addEventListener('visibilitychange', () => {
+  if (busy && document.hidden) runError = 'page became hidden; run interrupted';
+});
+function checkRun() {
+  const error = runError || baselineError || gpu?.error;
+  if (error) throw new Error(String(error));
+  if (activeRun?.baseline.camera &&
+      (!camOn || !camStream || camStream.getVideoTracks().some(t => t.readyState !== 'live' || t.muted))) {
+    throw new Error('camera baseline interrupted');
+  }
+}
 $('bStop').onclick = () => { stopFlag = true; };
 
 async function runProbe(mode, allocStep) {
+  if (busy || startingCamera) return;
+  if (document.hidden || baselineError) {
+    log('Cannot start: keep the page visible and reload after a baseline error.');
+    return;
+  }
   const step = +$('selStep').value, max = +$('selMax').value;
-  const mult = mode === 'JS+GPU' ? 2 : 1;                 // JS+GPU allocates step MB on each side
-  stopFlag = false; setBusy(true);
-  log(`--- ${mode} probe: step ${step * mult} MB, limit ${max} MB total, camera ${camOn ? 'on' : 'off'}, random data ---`);
-  let mb = 0, outcome = 'reached limit without failure', lock = null;
-  try { lock = await navigator.wakeLock?.request('screen'); } catch (e) {}   // stop auto-lock suspending the page
+  const mult = mode === 'JS+GPU' ? 2 : 1;
+  stopFlag = false; runError = null; setBusy(true);
+  let mb = 0, outcome = 'reached configured buffer limit (not a measured maximum)', lock = null;
+  activeRun = {
+    version: 3, running: true, mode, startedAt: new Date().toISOString(),
+    ua: navigator.userAgent, phase: 'initializing', completedMiB: 0, attemptedMiB: 0,
+    stepMiBPerSide: step, limitMiB: max,
+    baseline: { camera: camOn, hand: !!hand, face: !!face,
+      delegate: camOn ? $('selDel').value : null }
+  };
+  crumb(activeRun);
+  log('--- ' + JSON.stringify(activeRun) + ' ---');
   try {
+    try { lock = await navigator.wakeLock?.request('screen'); }
+    catch (e) { log('wake lock unavailable: ' + e); }
     makePool();
     const ctx = await allocStep.init(step);
     while (mb * mult < max && !stopFlag) {
-      crumb({ running: true, mode, mb: mb * mult, step: step * mult, cam: camOn });   // written BEFORE the risky step
-      await allocStep.next(ctx, step);
-      mb += step;
-      log(`${mode} allocated ${mb * mult} MB`);
+      checkRun();
+      const nextStep = Math.min(step, (max - mb * mult) / mult);
+      activeRun.phase = 'allocating';
+      activeRun.attemptedMiB = (mb + nextStep) * mult;
+      crumb(activeRun);
+      await allocStep.next(ctx, nextStep);
+      checkRun();
+      mb += nextStep;
+      activeRun.completedMiB = mb * mult;
+      activeRun.phase = 'between steps';
+      crumb(activeRun);
+      log('Completed buffer capacity: ' + activeRun.completedMiB + ' MiB');
       await new Promise(r => setTimeout(r, 60));
     }
+    checkRun();
     if (stopFlag) outcome = 'stopped by you';
   } catch (e) {
-    outcome = 'FAILED: ' + (e && e.message || e);
+    outcome = 'FAILED / INTERRUPTED: ' + (e?.message || e);
+  } finally {
+    activeRun.phase = 'cleanup';
+    activeRun.outcome = outcome;
+    crumb(activeRun);
+    try { allocStep.free?.(); }
+    catch (e) { outcome += '; cleanup error: ' + e; }
+    pool = null;
+    try { await lock?.release(); } catch (e) { log('wake lock release: ' + e); }
+    activeRun.running = false;
+    activeRun.phase = 'finished';
+    activeRun.outcome = outcome;
+    crumb(activeRun);
+    setBusy(false);
+    log('RESULT ' + mode + ' | last completed capacity ' + activeRun.completedMiB +
+      ' MiB | attempted capacity ' + activeRun.attemptedMiB + ' MiB | ' + outcome);
+    log('Not peak process memory. Failed steps may allocate partially. Reload before comparing runs.');
+    activeRun = null;
   }
-  const peak = mb * mult;
-  crumb({ running: false, mode, mb: peak, step: step * mult, cam: camOn });
-  allocStep.free && allocStep.free();
-  try { lock && lock.release(); } catch (e) {}
-  setBusy(false);
-  log(`RESULT ${mode} | camera ${camOn ? 'on' : 'off'} | peak ${peak} MB | ${outcome}`);
 }
 
 const held = [];
@@ -217,25 +333,56 @@ const gpuProbe = {
     if (!navigator.gpu) throw new Error('WebGPU not available');
     const a = await navigator.gpu.requestAdapter();
     if (!a) throw new Error('no WebGPU adapter');
-    const size = Math.min(step * 1048576, a.limits.maxBufferSize);
-    if (size < step * 1048576) log('note: maxBufferSize caps each buffer at ' + (size / 1048576 | 0) + ' MB');
-    const dev = await a.requestDevice({ requiredLimits: {
-      maxBufferSize: a.limits.maxBufferSize, maxStorageBufferBindingSize: a.limits.maxStorageBufferBindingSize } });
-    dev.lost.then(i => log('GPU device lost: ' + i.reason + ' ' + i.message));
-    gpu = { dev, bufs: [], size, filler: makePool() };
-    return gpu;
+    const size = step * 1048576;
+    if (size > a.limits.maxBufferSize) {
+      throw new Error('Requested step exceeds maxBufferSize; choose a smaller step. This is not an OOM result.');
+    }
+    const dev = await a.requestDevice({ requiredLimits: { maxBufferSize: size } });
+    const g = { dev, bufs: [], filler: makePool(), error: null, closing: false };
+    let fail;
+    g.failed = new Promise(resolve => { fail = resolve; });
+    const recordFailure = error => {
+      if (g.closing) return;
+      g.error = error;
+      fail(error);
+    };
+    dev.lost.then(i => recordFailure(new Error('GPU device lost: ' + i.reason + ' ' + i.message)));
+    dev.addEventListener('uncapturederror', e => recordFailure(new Error(e.error.message)));
+    gpu = g;
+    return g;
   },
-  next: async (g) => {
-    g.dev.pushErrorScope('out-of-memory');
-    const b = g.dev.createBuffer({ size: g.size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    for (let off = 0; off < g.size; off += g.filler.byteLength)       // write so memory is really committed
-      g.dev.queue.writeBuffer(b, off, g.filler, 0, Math.min(g.filler.byteLength, g.size - off));
-    await g.dev.queue.onSubmittedWorkDone();
-    const err = await g.dev.popErrorScope();
-    if (err) throw new Error('out-of-memory: ' + err.message);
-    g.bufs.push(b);
+  next: async (g, step) => {
+    if (g.error) throw g.error;
+    const size = step * 1048576;
+    const filters = ['out-of-memory', 'validation', 'internal'];
+    filters.forEach(filter => g.dev.pushErrorScope(filter));
+    let failure = null;
+    try {
+      const b = g.dev.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      g.bufs.push(b); // Also clean up buffers belonging to an unsuccessful step.
+      for (let off = 0; off < size; off += g.filler.byteLength)
+        g.dev.queue.writeBuffer(b, off, g.filler, 0, Math.min(g.filler.byteLength, size - off));
+      failure = await Promise.race([
+        g.dev.queue.onSubmittedWorkDone().then(() => null), g.failed
+      ]);
+    } catch (e) { failure = e; }
+    finally {
+      const errors = await Promise.all(filters.map(() => g.dev.popErrorScope()));
+      const index = errors.findIndex(Boolean);
+      if (index !== -1) {
+        failure = new Error(filters[filters.length - 1 - index] + ': ' + errors[index].message);
+      }
+    }
+    if (failure || g.error) throw failure || g.error;
   },
-  free: () => { if (gpu) { gpu.bufs.forEach(b => b.destroy()); gpu.dev.destroy(); gpu = null; } }
+  free: () => {
+    if (!gpu) return;
+    const g = gpu;
+    gpu = null;
+    g.closing = true; // Intentional destruction is not an unexpected device loss.
+    try { g.bufs.forEach(b => b.destroy()); }
+    finally { g.dev.destroy(); g.bufs.length = 0; g.filler = null; }
+  }
 };
 
 const bothProbe = {
@@ -250,3 +397,4 @@ $('bBoth').onclick = () => runProbe('JS+GPU', bothProbe);
 </script>
 </body>
 </html>
+
